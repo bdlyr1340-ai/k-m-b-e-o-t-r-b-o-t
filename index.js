@@ -292,7 +292,7 @@ async function getVisibleViewportSize(page) {
   }));
 }
 
-async function renderMouseGridAndScreenshot(page, outputPath, cols = 20, rows = 12) {
+async function renderMouseGridAndScreenshot(page, outputPath, cols = 25, rows = 40) {
   const info = await getVisibleViewportSize(page);
 
   await page.evaluate(({ cols, rows }) => {
@@ -325,21 +325,21 @@ async function renderMouseGridAndScreenshot(page, outputPath, cols = 20, rows = 
         cell.style.width = `${cellW}px`;
         cell.style.height = `${cellH}px`;
         cell.style.boxSizing = 'border-box';
-        cell.style.border = '1px solid rgba(120, 120, 120, 0.75)';
-        cell.style.background = 'rgba(150, 150, 150, 0.10)';
+        cell.style.border = '1px solid rgba(110, 110, 110, 0.45)';
+        cell.style.background = 'rgba(140, 140, 140, 0.06)';
 
         const label = document.createElement('div');
         label.textContent = String(counter);
         label.style.position = 'absolute';
-        label.style.left = '3px';
-        label.style.top = '3px';
-        label.style.padding = '1px 4px';
-        label.style.fontSize = '11px';
+        label.style.left = '1px';
+        label.style.top = '1px';
+        label.style.padding = '0px 2px';
+        label.style.fontSize = '8px';
         label.style.fontWeight = '700';
-        label.style.color = '#222';
-        label.style.background = 'rgba(235, 235, 235, 0.85)';
-        label.style.border = '1px solid rgba(80, 80, 80, 0.6)';
-        label.style.borderRadius = '4px';
+        label.style.color = '#2b2b2b';
+        label.style.background = 'rgba(235, 235, 235, 0.45)';
+        label.style.border = '1px solid rgba(80, 80, 80, 0.22)';
+        label.style.borderRadius = '2px';
         label.style.lineHeight = '1.1';
 
         cell.appendChild(label);
@@ -639,7 +639,7 @@ bot.on('callback_query', async (query) => {
 
     if (data === 'browser_mouse_grid') {
       const imagePath = path.join(os.tmpdir(), `grid_${Date.now()}.png`);
-      session.lastGrid = await renderMouseGridAndScreenshot(session.page, imagePath, 20, 12);
+      session.lastGrid = await renderMouseGridAndScreenshot(session.page, imagePath, 25, 40);
       await bot.sendPhoto(chatId, imagePath, {
         caption: `هذه شبكة الماوس.\nأرسل رقم المربع من 1 إلى ${session.lastGrid.totalCells} ليتم الضغط عليه.`
       });
