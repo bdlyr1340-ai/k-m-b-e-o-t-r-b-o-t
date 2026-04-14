@@ -88,6 +88,27 @@ sessions[chatId] = {
 */
 const sessions = {};
 const pendingComputerRequests = {}; // by requester chatId
+const approvedUsersFile = path.join(process.cwd(), 'approved_users.json');
+
+function loadApprovedUsers() {
+  try {
+    if (!fs.existsSync(approvedUsersFile)) return {};
+    const raw = fs.readFileSync(approvedUsersFile, 'utf8');
+    return JSON.parse(raw || '{}');
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveApprovedUsers(data) {
+  try {
+    fs.writeFileSync(approvedUsersFile, JSON.stringify(data, null, 2), 'utf8');
+  } catch (err) {
+    console.error('Failed to save approved users:', err);
+  }
+}
+
+const approvedUsers = loadApprovedUsers();
 
 function getSession(chatId) {
   const id = String(chatId);
@@ -141,8 +162,8 @@ function createKeyboard(isAdminUser) {
   return { inline_keyboard: keyboard };
 }
 
-function createHomeKeyboard(isAdminUser) {
-  if (isAdminUser) {
+function createHomeKeyboard(isAdminUser, chatId = '') {
+  if (isAdminUser || approvedUsers[String(chatId)]) {
     return {
       inline_keyboard: [
         [{ text: 'وضع الكمبيوتر', callback_data: 'start_computer_mode' }]
@@ -511,7 +532,7 @@ async function findTextAndClick(page, searchText) {
 bot.onText(/\/start/, async (msg) => {
   const chatId = String(msg.chat.id);
   await bot.sendMessage(chatId, 'اختر الخدمة:', {
-    reply_markup: createHomeKeyboard(isAdmin(chatId))
+    reply_markup: createHomeKeyboard(isAdmin(chatId), chatId)
   });
 });
 
@@ -527,8 +548,8 @@ bot.on('callback_query', async (query) => {
 
   try {
     if (data === 'start_computer_mode') {
-      if (!isAdmin(chatId)) {
-        return bot.sendMessage(chatId, 'هذا الخيار للأدمن فقط.');
+      if (!isAdmin(chatId) && !approvedUsers[String(chatId)]) {
+        return bot.sendMessage(chatId, 'هذا الخيار يحتاج موافقة الأدمن أول مرة فقط.');
       }
 
       await ensureBrowserSession(chatId);
@@ -537,8 +558,9 @@ bot.on('callback_query', async (query) => {
     }
 
     if (data === 'request_computer_mode') {
-      if (isAdmin(chatId)) {
+      if (isAdmin(chatId) || approvedUsers[String(chatId)]) {
         await ensureBrowserSession(chatId);
+        await sendPageScreenshot(chatId, session.page, 'Browser started successfully.');
         return sendBrowserMenu(chatId);
       }
 
@@ -583,6 +605,12 @@ bot.on('callback_query', async (query) => {
 
       const requesterSession = getSession(requesterChatId);
       requesterSession.approvedByAdmin = true;
+      approvedUsers[String(requesterChatId)] = {
+        approved: true,
+        approvedAt: nowIso(),
+        approvedBy: String(chatId)
+      };
+      saveApprovedUsers(approvedUsers);
 
       await ensureBrowserSession(requesterChatId);
       delete pendingComputerRequests[requesterChatId];
@@ -667,7 +695,7 @@ bot.on('callback_query', async (query) => {
       fs.unlinkSync(filePath);
 
       return bot.sendMessage(chatId, 'تم حفظ التقرير وإنهاء الجلسة.', {
-        reply_markup: createHomeKeyboard(isAdmin(chatId))
+        reply_markup: createHomeKeyboard(isAdmin(chatId), chatId)
       });
     }
   } catch (error) {
