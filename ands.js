@@ -1,321 +1,1026 @@
+/*
+==========================================================
+Telegram Browser Control Bot - Clean Minimal Edition
+==========================================================
+What this version keeps:
+- Browser control only
+- Admin-only direct computer mode
+- Non-admin request -> admin approve/reject
+- Browser buttons:
+  1) Open URL
+  2) Refresh Screen
+  3) Enter
+  4) Type Text
+  5) Mouse Grid
+  6) Search Text And Click
+  7) Save And End Session
+- ADMIN_ID is read from environment variables
+- Detailed English TXT script is generated at session end
 
+Required environment variables:
+- BOT_TOKEN
+- ADMIN_ID
+Optional:
+- PORT
+- HEADLESS=true|false
+*/
+
+const TelegramBot = require('node-telegram-bot-api');
+const { chromium } = require('playwright-extra');
+const stealth = require('puppeteer-extra-plugin-stealth')();
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const http = require('http');
 
-function clamp(v, min, max) {
-    return Math.max(min, Math.min(max, v));
+chromium.use(stealth);
+
+// --------------------------------------------------
+// 1) Environment
+// --------------------------------------------------
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID = String(process.env.ADMIN_ID || '').trim();
+const PORT = Number(process.env.PORT || 3000);
+const HEADLESS = String(process.env.HEADLESS || 'true').toLowerCase() !== 'false';
+
+if (!BOT_TOKEN) {
+  console.error('Missing BOT_TOKEN in environment variables.');
+  process.exit(1);
 }
 
-function rand(min, max) {
-    return Math.random() * (max - min) + min;
+if (!ADMIN_ID) {
+  console.error('Missing ADMIN_ID in environment variables.');
+  process.exit(1);
 }
 
-function randInt(min, max) {
-    return Math.floor(rand(min, max + 1));
+// --------------------------------------------------
+// 2) Keep-alive server (useful on Railway / similar)
+// --------------------------------------------------
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Telegram Browser Control Bot is running.');
+}).listen(PORT, () => {
+  console.log(`HTTP server listening on port ${PORT}`);
+});
+
+// --------------------------------------------------
+// 3) Telegram bot
+// --------------------------------------------------
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+function isAdmin(chatId) {
+  return String(chatId) === ADMIN_ID;
+}
+
+// --------------------------------------------------
+// 4) In-memory state
+// --------------------------------------------------
+/*
+sessions[chatId] = {
+  browser,
+  context,
+  page,
+  step,
+  lastGrid,
+  recorder,
+  approvedByAdmin,
+  waitTimerStartedAt,
+  waitTimerPageUrl
+}
+*/
+const sessions = {};
+const pendingComputerRequests = {}; // by requester chatId
+const approvedUsersFile = path.join(process.cwd(), 'approved_users.json');
+
+function loadApprovedUsers() {
+  try {
+    if (!fs.existsSync(approvedUsersFile)) return {};
+    const raw = fs.readFileSync(approvedUsersFile, 'utf8');
+    return JSON.parse(raw || '{}');
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveApprovedUsers(data) {
+  try {
+    fs.writeFileSync(approvedUsersFile, JSON.stringify(data, null, 2), 'utf8');
+  } catch (err) {
+    console.error('Failed to save approved users:', err);
+  }
+}
+
+const approvedUsers = loadApprovedUsers();
+
+function getSession(chatId) {
+  const id = String(chatId);
+  if (!sessions[id]) {
+    sessions[id] = {
+      browser: null,
+      context: null,
+      page: null,
+      step: null,
+      lastGrid: null,
+      recorder: null,
+      approvedByAdmin: false,
+      waitTimerStartedAt: null,
+      waitTimerPageUrl: null
+    };
+  }
+  return sessions[id];
+}
+
+// --------------------------------------------------
+// 5) Utilities
+// --------------------------------------------------
+function nowIso() {
+  return new Date().toISOString();
 }
 
 function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function easeInOut(t) {
-    return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+function safeUsername(msg) {
+  return msg?.from?.username ? '@' + msg.from.username : 'No username';
 }
 
-function bezierPoint(p0, p1, p2, p3, t) {
-    const mt = 1 - t;
+function sanitizeFileName(name) {
+  return String(name || 'session')
+    .replace(/[^\w.-]+/g, '_')
+    .replace(/_+/g, '_')
+    .slice(0, 80);
+}
+
+function createKeyboard(isAdminUser) {
+  const keyboard = [
+    [{ text: 'فتح الرابط', callback_data: 'browser_open_url' }],
+    [{ text: 'تحديث الشاشة', callback_data: 'browser_refresh' }],
+    [{ text: 'انتر', callback_data: 'browser_enter' }],
+    [{ text: 'كتابة نص', callback_data: 'browser_type_text' }],
+    [{ text: 'نزول', callback_data: 'browser_scroll_down' }, { text: 'صعود', callback_data: 'browser_scroll_up' }],
+    [{ text: 'شبكة الماوس', callback_data: 'browser_mouse_grid' }],
+    [{ text: 'البحث عن النص والضغط عليه', callback_data: 'browser_find_text_click' }],
+    [{ text: 'بحث عن النص والضغط عليه ومسحه', callback_data: 'browser_find_text_click_clear' }],
+    [{ text: 'تسجيل الوقت', callback_data: 'browser_toggle_timer' }],
+    [{ text: 'حفظ وانهاء الجلسة', callback_data: 'browser_save_end' }]
+  ];
+
+  return { inline_keyboard: keyboard };
+}
+
+function createHomeKeyboard(isAdminUser, chatId = '') {
+  if (isAdminUser || approvedUsers[String(chatId)]) {
     return {
-        x: Math.pow(mt, 3) * p0.x + 3 * Math.pow(mt, 2) * t * p1.x + 3 * mt * Math.pow(t, 2) * p2.x + Math.pow(t, 3) * p3.x,
-        y: Math.pow(mt, 3) * p0.y + 3 * Math.pow(mt, 2) * t * p1.y + 3 * mt * Math.pow(t, 2) * p2.y + Math.pow(t, 3) * p3.y
+      inline_keyboard: [
+        [{ text: 'وضع الكمبيوتر', callback_data: 'start_computer_mode' }]
+      ]
     };
+  }
+
+  return {
+    inline_keyboard: [
+      [{ text: 'طلب وضع الكمبيوتر', callback_data: 'request_computer_mode' }]
+    ]
+  };
 }
 
+// --------------------------------------------------
+// 6) Recorder
+// --------------------------------------------------
 class ScriptRecorder {
-    constructor(outputDir = process.cwd()) {
-        this.outputDir = outputDir;
-        this.lines = [];
-        this.stepCounter = 1;
-        this.ensureDir();
+  constructor(ownerChatId) {
+    this.ownerChatId = String(ownerChatId);
+    this.startedAt = nowIso();
+    this.lines = [];
+    this.step = 1;
+
+    this.writeHeader();
+  }
+
+  writeHeader() {
+    this.lines.push('DETAILED BROWSER SESSION REPORT');
+    this.lines.push('========================================');
+    this.lines.push(`Started at: ${this.startedAt}`);
+    this.lines.push(`Owner chat id: ${this.ownerChatId}`);
+    this.lines.push('');
+    this.lines.push('This file records the browser actions executed from the Telegram bot.');
+    this.lines.push('All notes below are intentionally written in English and in a concise audit style.');
+    this.lines.push('');
+  }
+
+  add(title, details = []) {
+    const number = this.step++;
+    this.lines.push(`STEP ${number}: ${title}`);
+    for (const detail of details) {
+      this.lines.push(`- ${detail}`);
     }
+    this.lines.push('');
+  }
 
-    ensureDir() {
-        fs.mkdirSync(this.outputDir, { recursive: true });
-    }
+  finalize() {
+    this.lines.push('SESSION END');
+    this.lines.push('========================================');
+    this.lines.push(`Ended at: ${nowIso()}`);
+    this.lines.push('');
+    return this.lines.join('\n');
+  }
+}
 
-    addComment(comment) {
-        this.lines.push(`\n  // ${String(this.stepCounter).padStart(2, '0')} - ${comment}`);
-        this.stepCounter += 1;
-    }
+// --------------------------------------------------
+// 7) Browser session helpers
+// --------------------------------------------------
+async function ensureBrowserSession(chatId) {
+  const session = getSession(chatId);
 
-    addRaw(line) {
-        this.lines.push(`  ${line}`);
-    }
+  if (session.browser && session.context && session.page) {
+    try {
+      await session.page.title().catch(() => null);
+      return session;
+    } catch (_) {}
+  }
 
-    build() {
-        return `const { chromium } = require('playwright');
-const { HumanizedComputer } = require('./ands');
+  const browser = await chromium.launch({
+    headless: HEADLESS,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage'
+    ]
+  });
 
-(async () => {
-  const browser = await chromium.launch({ headless: false });
-  const context = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+  });
+
   const page = await context.newPage();
-  const human = new HumanizedComputer(page, { recordScript: false });
-${this.lines.join('\n')}
-})();\n`;
-    }
+  await page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-    save(fileName = `manual_record_${Date.now()}.js`) {
-        this.ensureDir();
-        const full = path.join(this.outputDir, fileName);
-        fs.writeFileSync(full, this.build(), 'utf8');
-        return full;
-    }
+  session.browser = browser;
+  session.context = context;
+  session.page = page;
+  session.step = null;
+  session.lastGrid = null;
+  session.recorder = new ScriptRecorder(chatId);
+  session.waitTimerStartedAt = null;
+  session.waitTimerPageUrl = null;
+
+  session.recorder.add('Browser session started', [
+    `Initial URL opened: ${page.url()}`,
+    `Viewport: 1440 x 900`,
+    `Headless mode: ${HEADLESS}`
+  ]);
+
+  return session;
 }
 
-class HumanizedComputer {
-    constructor(page, options = {}) {
-        this.page = page;
-        this.viewport = options.viewport || { width: 1366, height: 768 };
-        this.pointer = {
-            x: rand(this.viewport.width * 0.35, this.viewport.width * 0.65),
-            y: rand(this.viewport.height * 0.80, this.viewport.height * 0.94)
-        };
-        this.recordScript = options.recordScript !== false;
-        this.recorder = options.recorder || null;
-        this.defaultTypingDelay = options.defaultTypingDelay || [45, 140];
-        this.defaultMoveDuration = options.defaultMoveDuration || [500, 1800];
-        this.mistakeChance = options.mistakeChance == null ? 0.06 : options.mistakeChance;
-        this.keyboardLayout = 'qwertyuiopasdfghjklzxcvbnm';
-    }
-
-    setRecorder(recorder) {
-        this.recorder = recorder;
-    }
-
-    setPage(page) {
-        this.page = page;
-    }
-
-    note(comment) {
-        if (this.recordScript && this.recorder) this.recorder.addComment(comment);
-    }
-
-    raw(line) {
-        if (this.recordScript && this.recorder) this.recorder.addRaw(line);
-    }
-
-    currentPoint() {
-        return { x: this.pointer.x, y: this.pointer.y };
-    }
-
-    async syncViewport() {
-        try {
-            const vp = this.page.viewportSize();
-            if (vp) this.viewport = vp;
-        } catch (e) {}
-    }
-
-    async moveMouseHuman(targetX, targetY, opts = {}) {
-        await this.syncViewport();
-        const start = this.currentPoint();
-        const target = {
-            x: clamp(targetX, 1, this.viewport.width - 1),
-            y: clamp(targetY, 1, this.viewport.height - 1)
-        };
-        const dx = target.x - start.x;
-        const dy = target.y - start.y;
-        const distance = Math.hypot(dx, dy);
-        const duration = opts.duration || clamp(distance * rand(1.8, 3.4), this.defaultMoveDuration[0], this.defaultMoveDuration[1] + distance * 1.4);
-        const steps = opts.steps || clamp(Math.round(distance / rand(7, 13)), 18, 130);
-        const spread = clamp(distance * rand(0.10, 0.22), 25, 180);
-
-        const p1 = { x: start.x + dx * rand(0.18, 0.32) + rand(-spread, spread), y: start.y + dy * rand(0.18, 0.32) + rand(-spread, spread) };
-        const p2 = { x: start.x + dx * rand(0.66, 0.84) + rand(-spread, spread), y: start.y + dy * rand(0.66, 0.84) + rand(-spread, spread) };
-
-        for (let i = 1; i <= steps; i++) {
-            const t = easeInOut(i / steps);
-            const point = bezierPoint(start, p1, p2, target, t);
-            const jitterScale = i > steps - 4 ? 0.45 : 1;
-            const x = clamp(point.x + rand(-1.4, 1.4) * jitterScale, 1, this.viewport.width - 1);
-            const y = clamp(point.y + rand(-1.4, 1.4) * jitterScale, 1, this.viewport.height - 1);
-            await this.page.mouse.move(x, y);
-            await sleep(Math.max(5, duration / steps + rand(-3, 7)));
-        }
-
-        this.pointer = target;
-        if (opts.record !== false) {
-            this.raw(`await human.moveMouseHuman(${target.x.toFixed(2)}, ${target.y.toFixed(2)});`);
-        }
-    }
-
-    async clickHuman(x, y, opts = {}) {
-        await this.moveMouseHuman(x, y, { duration: opts.moveDuration, steps: opts.steps, record: opts.record });
-        await sleep(randInt(40, 140));
-        await this.page.mouse.down();
-        await sleep(randInt(35, 120));
-        await this.page.mouse.up();
-        await sleep(randInt(60, 180));
-        if (opts.record !== false) {
-            this.raw(`await human.clickHuman(${Number(x).toFixed(2)}, ${Number(y).toFixed(2)});`);
-        }
-    }
-
-    async pressKeyHuman(key, opts = {}) {
-        await sleep(randInt(35, 110));
-        await this.page.keyboard.down(key);
-        await sleep(randInt(25, 90));
-        await this.page.keyboard.up(key);
-        await sleep(randInt(50, 140));
-        if (opts.record !== false) {
-            this.raw(`await human.pressKeyHuman(${JSON.stringify(key)});`);
-        }
-    }
-
-    randomNeighborChar(ch) {
-        const lower = String(ch || '').toLowerCase();
-        if (!/[a-z]/.test(lower)) return lower || 'a';
-        const idx = this.keyboardLayout.indexOf(lower);
-        if (idx === -1) return 'a';
-        const offset = Math.random() > 0.5 ? 1 : -1;
-        return this.keyboardLayout[clamp(idx + offset, 0, this.keyboardLayout.length - 1)];
-    }
-
-    async typeHuman(text, opts = {}) {
-        const str = String(text || '');
-        for (const ch of str) {
-            if (/[a-zA-Z]/.test(ch) && Math.random() < (opts.mistakeChance ?? this.mistakeChance)) {
-                const wrong = this.randomNeighborChar(ch);
-                await this.page.keyboard.type(wrong, { delay: randInt(35, 90) });
-                await sleep(randInt(40, 110));
-                await this.page.keyboard.press('Backspace');
-                await sleep(randInt(60, 120));
-            }
-            const delay = randInt(opts.minDelay || this.defaultTypingDelay[0], opts.maxDelay || this.defaultTypingDelay[1]);
-            await this.page.keyboard.type(ch, { delay });
-            if (/[\s,.;:!?]/.test(ch)) {
-                await sleep(randInt(30, 140));
-            } else if (Math.random() < 0.08) {
-                await sleep(randInt(35, 120));
-            }
-        }
-        if (opts.record !== false) {
-            this.raw(`await human.typeHuman(${JSON.stringify(str)});`);
-        }
-    }
-
-    async scrollHuman(amount = 700, opts = {}) {
-        const parts = opts.parts || clamp(Math.round(Math.abs(amount) / 260), 2, 8);
-        const base = amount / parts;
-        for (let i = 0; i < parts; i++) {
-            const delta = base + rand(-40, 40);
-            await this.page.mouse.wheel(0, delta);
-            await sleep(randInt(80, 220));
-        }
-        if (opts.record !== false) {
-            this.raw(`await human.scrollHuman(${Math.round(amount)});`);
-        }
-    }
-
-    async gotoHuman(url, opts = {}) {
-        await this.page.goto(url, { waitUntil: opts.waitUntil || 'domcontentloaded', timeout: opts.timeout || 45000 });
-        await sleep(randInt(700, 1600));
-        if (opts.record !== false) {
-            this.raw(`await human.gotoHuman(${JSON.stringify(url)});`);
-        }
-    }
-
-    async moveToGridCellFromBottom(cellNumber, gridInfo, opts = {}) {
-        const cols = gridInfo.cols;
-        const rows = gridInfo.rows;
-        const cellWidth = gridInfo.cellWidth;
-        const cellHeight = gridInfo.cellHeight;
-        const total = cols * rows;
-        const normalizedCell = clamp(Number(cellNumber) || 1, 1, total);
-        const index = normalizedCell - 1;
-        const col = index % cols;
-        const row = Math.floor(index / cols);
-        const x = (col * cellWidth) + cellWidth / 2;
-        const y = (row * cellHeight) + cellHeight / 2;
-        const startX = this.viewport.width / 2 + rand(-60, 60);
-        const startY = this.viewport.height - rand(12, 28);
-        await this.moveMouseHuman(startX, startY, { duration: randInt(300, 700), record: false });
-        await sleep(randInt(100, 260));
-        await this.moveMouseHuman(x, y, { duration: opts.duration || randInt(1200, 2600), record: false });
-        if (opts.click) {
-            await this.clickHuman(x, y, { record: false });
-        }
-        if (opts.record !== false) {
-            this.raw(`await human.moveToGridCellFromBottom(${normalizedCell}, ${JSON.stringify(gridInfo)}, ${JSON.stringify({ click: !!opts.click })});`);
-        }
-        return { x, y, row, col, cellNumber: normalizedCell };
-    }
-
-    async clickElementCenter(selector, opts = {}) {
-        const box = await this.page.locator(selector).first().boundingBox();
-        if (!box) throw new Error(`Element not found for selector: ${selector}`);
-        const x = box.x + box.width / 2;
-        const y = box.y + box.height / 2;
-        await this.clickHuman(x, y, { record: false });
-        if (opts.record !== false) this.raw(`await human.clickElementCenter(${JSON.stringify(selector)});`);
-        return { x, y };
-    }
-
-    async captureGridScreenshot(filePath, opts = {}) {
-        await this.syncViewport();
-        const cols = opts.cols || 6;
-        const rows = opts.rows || 8;
-        const gridInfo = {
-            cols,
-            rows,
-            cellWidth: this.viewport.width / cols,
-            cellHeight: this.viewport.height / rows,
-            viewport: { ...this.viewport }
-        };
-
-        await this.page.evaluate(({ cols, rows }) => {
-            const old = document.getElementById('__human_grid_overlay__');
-            if (old) old.remove();
-            const overlay = document.createElement('div');
-            overlay.id = '__human_grid_overlay__';
-            overlay.style.position = 'fixed';
-            overlay.style.inset = '0';
-            overlay.style.zIndex = '2147483647';
-            overlay.style.pointerEvents = 'none';
-            overlay.style.fontFamily = 'Arial, sans-serif';
-            overlay.style.backgroundImage = `linear-gradient(to right, rgba(255,0,0,.35) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,0,0,.35) 1px, transparent 1px)`;
-            overlay.style.backgroundSize = `${100 / cols}% ${100 / rows}%`;
-            document.body.appendChild(overlay);
-            let counter = 1;
-            for (let r = 0; r < rows; r++) {
-                for (let c = 0; c < cols; c++) {
-                    const badge = document.createElement('div');
-                    badge.textContent = String(counter++);
-                    badge.style.position = 'fixed';
-                    badge.style.left = `calc(${(c * 100) / cols}% + 8px)`;
-                    badge.style.top = `calc(${(r * 100) / rows}% + 8px)`;
-                    badge.style.color = '#fff';
-                    badge.style.background = 'rgba(220,0,0,.85)';
-                    badge.style.padding = '2px 6px';
-                    badge.style.borderRadius = '999px';
-                    badge.style.fontSize = '14px';
-                    badge.style.fontWeight = '700';
-                    badge.style.boxShadow = '0 1px 4px rgba(0,0,0,.35)';
-                    overlay.appendChild(badge);
-                }
-            }
-        }, { cols, rows });
-
-        await this.page.screenshot({ path: filePath, fullPage: false });
-        await this.page.evaluate(() => document.getElementById('__human_grid_overlay__')?.remove()).catch(() => {});
-        return gridInfo;
-    }
+async function sendBrowserMenu(chatId, text = 'تم فتح وضع الكمبيوتر.') {
+  return bot.sendMessage(chatId, text, {
+    reply_markup: createKeyboard(isAdmin(chatId))
+  });
 }
 
-module.exports = {
-    HumanizedComputer,
-    ScriptRecorder,
-    sleep,
-    rand,
-    randInt,
-    clamp
-};
+async function sendPageScreenshot(chatId, page, caption = 'Current screen') {
+  const filePath = path.join(os.tmpdir(), `screen_${Date.now()}_${Math.random().toString(36).slice(2)}.png`);
+  await page.screenshot({ path: filePath, fullPage: false });
+  await bot.sendPhoto(chatId, filePath, { caption });
+  fs.unlinkSync(filePath);
+}
+
+async function closeBrowserSession(chatId) {
+  const session = getSession(chatId);
+
+  try { if (session.page) await session.page.close().catch(() => {}); } catch (_) {}
+  try { if (session.context) await session.context.close().catch(() => {}); } catch (_) {}
+  try { if (session.browser) await session.browser.close().catch(() => {}); } catch (_) {}
+
+  session.browser = null;
+  session.context = null;
+  session.page = null;
+  session.step = null;
+  session.lastGrid = null;
+  session.waitTimerStartedAt = null;
+  session.waitTimerPageUrl = null;
+}
+
+// --------------------------------------------------
+// 8) Human-like actions
+// --------------------------------------------------
+async function typeLikeHuman(page, text) {
+  for (const ch of String(text)) {
+    await page.keyboard.type(ch, { delay: 60 + Math.floor(Math.random() * 70) });
+    await sleep(20 + Math.floor(Math.random() * 60));
+  }
+}
+
+async function getVisibleViewportSize(page) {
+  return await page.evaluate(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight,
+    scrollX: window.scrollX,
+    scrollY: window.scrollY
+  }));
+}
+
+async function renderMouseGridAndScreenshot(page, outputPath, cols = 25, rows = 40) {
+  const info = await getVisibleViewportSize(page);
+
+  await page.evaluate(({ cols, rows }) => {
+    const old = document.getElementById('__tg_mouse_grid_overlay__');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = '__tg_mouse_grid_overlay__';
+    overlay.style.position = 'fixed';
+    overlay.style.left = '0';
+    overlay.style.top = '0';
+    overlay.style.width = '100vw';
+    overlay.style.height = '100vh';
+    overlay.style.zIndex = '2147483647';
+    overlay.style.pointerEvents = 'none';
+    overlay.style.background = 'transparent';
+
+    const viewportW = window.innerWidth;
+    const viewportH = window.innerHeight;
+    const cellW = viewportW / cols;
+    const cellH = viewportH / rows;
+
+    let counter = 1;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const cell = document.createElement('div');
+        cell.style.position = 'absolute';
+        cell.style.left = `${c * cellW}px`;
+        cell.style.top = `${r * cellH}px`;
+        cell.style.width = `${cellW}px`;
+        cell.style.height = `${cellH}px`;
+        cell.style.boxSizing = 'border-box';
+        cell.style.border = '1px solid rgba(110, 110, 110, 0.45)';
+        cell.style.background = 'rgba(140, 140, 140, 0.06)';
+
+        const label = document.createElement('div');
+        label.textContent = String(counter);
+        label.style.position = 'absolute';
+        label.style.left = '1px';
+        label.style.top = '1px';
+        label.style.padding = '0px 2px';
+        label.style.fontSize = '8px';
+        label.style.fontWeight = '700';
+        label.style.color = '#2b2b2b';
+        label.style.background = 'rgba(235, 235, 235, 0.45)';
+        label.style.border = '1px solid rgba(80, 80, 80, 0.22)';
+        label.style.borderRadius = '2px';
+        label.style.lineHeight = '1.1';
+
+        cell.appendChild(label);
+        overlay.appendChild(cell);
+        counter++;
+      }
+    }
+
+    document.documentElement.appendChild(overlay);
+  }, { cols, rows });
+
+  await page.screenshot({ path: outputPath, fullPage: false });
+
+  await page.evaluate(() => {
+    const old = document.getElementById('__tg_mouse_grid_overlay__');
+    if (old) old.remove();
+  });
+
+  return {
+    cols,
+    rows,
+    viewportWidth: info.width,
+    viewportHeight: info.height,
+    scrollX: info.scrollX,
+    scrollY: info.scrollY,
+    totalCells: cols * rows
+  };
+}
+
+function getCellCenter(grid, cellNumber) {
+  const index = Number(cellNumber) - 1;
+  if (!Number.isInteger(index) || index < 0 || index >= grid.totalCells) {
+    return null;
+  }
+
+  const col = index % grid.cols;
+  const row = Math.floor(index / grid.cols);
+
+  const cellWidth = grid.viewportWidth / grid.cols;
+  const cellHeight = grid.viewportHeight / grid.rows;
+
+  const x = col * cellWidth + cellWidth / 2;
+  const y = row * cellHeight + cellHeight / 2;
+
+  return {
+    cellNumber: Number(cellNumber),
+    col: col + 1,
+    row: row + 1,
+    x,
+    y,
+    absoluteX: grid.scrollX + x,
+    absoluteY: grid.scrollY + y
+  };
+}
+
+async function moveMouseLikeHuman(page, targetX, targetY) {
+  const size = await getVisibleViewportSize(page);
+  const startX = Math.max(8, Math.min(size.width - 8, size.width / 2));
+  const startY = Math.max(8, Math.min(size.height - 8, size.height - 12));
+
+  const steps = 28 + Math.floor(Math.random() * 18);
+
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const curve = t * t * (3 - 2 * t);
+    const wobbleX = (Math.random() - 0.5) * 6;
+    const wobbleY = (Math.random() - 0.5) * 6;
+
+    const x = startX + (targetX - startX) * curve + wobbleX;
+    const y = startY + (targetY - startY) * curve + wobbleY;
+
+    await page.mouse.move(x, y);
+    await sleep(8 + Math.floor(Math.random() * 22));
+  }
+
+  await page.mouse.move(targetX, targetY);
+}
+
+async function clickGridCell(page, grid, cellNumber) {
+  const target = getCellCenter(grid, cellNumber);
+  if (!target) {
+    throw new Error(`Invalid grid cell number. Allowed range: 1 to ${grid.totalCells}`);
+  }
+
+  await moveMouseLikeHuman(page, target.x, target.y);
+  await sleep(80 + Math.floor(Math.random() * 160));
+  await page.mouse.click(target.x, target.y, { delay: 40 + Math.floor(Math.random() * 120) });
+  return target;
+}
+
+async function findTextAndClick(page, searchText) {
+  const escaped = String(searchText).replace(/"/g, '\\"');
+  const locators = [
+    page.locator(`text="${searchText}"`).first(),
+    page.getByText(searchText, { exact: true }).first(),
+    page.getByText(searchText).first()
+  ];
+
+  for (const locator of locators) {
+    try {
+      const count = await locator.count().catch(() => 0);
+      if (!count) continue;
+
+      await locator.scrollIntoViewIfNeeded().catch(() => {});
+      await sleep(350);
+
+      const box = await locator.boundingBox();
+      if (!box) continue;
+
+      const centerX = box.x + box.width / 2;
+      const centerY = box.y + box.height / 2;
+
+      await moveMouseLikeHuman(page, centerX, centerY);
+      await sleep(100 + Math.floor(Math.random() * 150));
+      await page.mouse.click(centerX, centerY, { delay: 40 + Math.floor(Math.random() * 120) });
+
+      return {
+        ok: true,
+        text: searchText,
+        x: centerX,
+        y: centerY,
+        width: box.width,
+        height: box.height
+      };
+    } catch (_) {}
+  }
+
+  // Fallback DOM search
+  const fallback = await page.evaluate((needle) => {
+    const all = Array.from(document.querySelectorAll('button, a, span, div, p, li, input, textarea'));
+    const target = all.find(el => {
+      const text = (el.innerText || el.value || '').trim();
+      const rect = el.getBoundingClientRect();
+      return text && text.toLowerCase().includes(String(needle).toLowerCase()) && rect.width > 0 && rect.height > 0;
+    });
+
+    if (!target) return null;
+    target.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = target.getBoundingClientRect();
+    return {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      width: rect.width,
+      height: rect.height
+    };
+  }, searchText);
+
+  if (!fallback) {
+    return { ok: false };
+  }
+
+  await moveMouseLikeHuman(page, fallback.x, fallback.y);
+  await sleep(100 + Math.floor(Math.random() * 150));
+  await page.mouse.click(fallback.x, fallback.y, { delay: 50 + Math.floor(Math.random() * 120) });
+
+  return {
+    ok: true,
+    text: searchText,
+    x: fallback.x,
+    y: fallback.y,
+    width: fallback.width,
+    height: fallback.height
+  };
+}
+
+
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${hours}h ${minutes}m ${seconds}s`;
+}
+
+
+async function clearFocusedEditable(page) {
+  const result = await page.evaluate(() => {
+    const el = document.activeElement;
+    if (!el) return { ok: false, reason: 'No active element' };
+
+    const tag = (el.tagName || '').toLowerCase();
+    const isInput = tag === 'input' || tag === 'textarea';
+    const isEditable = !!el.isContentEditable;
+
+    if (!isInput && !isEditable) {
+      return { ok: false, reason: 'Active element is not editable' };
+    }
+
+    if (isInput) {
+      el.focus();
+      el.value = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, mode: tag };
+    }
+
+    if (isEditable) {
+      el.focus();
+      el.innerText = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      return { ok: true, mode: 'contenteditable' };
+    }
+
+    return { ok: false, reason: 'Unsupported editable target' };
+  });
+
+  if (result && result.ok) return result;
+
+  await page.keyboard.press('Control+A').catch(() => {});
+  await sleep(120);
+  await page.keyboard.press('Backspace').catch(() => {});
+  await sleep(120);
+  return { ok: true, mode: 'keyboard-fallback' };
+}
+
+async function findTextClickAndClear(page, searchText) {
+  const result = await findTextAndClick(page, searchText);
+  if (!result.ok) return result;
+
+  await sleep(180);
+  const clearResult = await clearFocusedEditable(page).catch(() => ({ ok: false, reason: 'clear failed' }));
+  return {
+    ...result,
+    cleared: !!(clearResult && clearResult.ok),
+    clearMode: clearResult && clearResult.mode ? clearResult.mode : 'unknown'
+  };
+}
+
+// --------------------------------------------------
+// 9) Start command
+// --------------------------------------------------
+bot.onText(/\/start/, async (msg) => {
+  const chatId = String(msg.chat.id);
+  await bot.sendMessage(chatId, 'اختر الخدمة:', {
+    reply_markup: createHomeKeyboard(isAdmin(chatId), chatId)
+  });
+});
+
+// --------------------------------------------------
+// 10) Callback query handler
+// --------------------------------------------------
+bot.on('callback_query', async (query) => {
+  const chatId = String(query.message.chat.id);
+  const data = query.data;
+  const session = getSession(chatId);
+
+  await bot.answerCallbackQuery(query.id).catch(() => {});
+
+  try {
+    if (data === 'start_computer_mode') {
+      if (!isAdmin(chatId) && !approvedUsers[String(chatId)]) {
+        return bot.sendMessage(chatId, 'هذا الخيار يحتاج موافقة الأدمن أول مرة فقط.');
+      }
+
+      await ensureBrowserSession(chatId);
+      await sendPageScreenshot(chatId, session.page, 'Browser started successfully.');
+      return sendBrowserMenu(chatId);
+    }
+
+    if (data === 'request_computer_mode') {
+      if (isAdmin(chatId) || approvedUsers[String(chatId)]) {
+        await ensureBrowserSession(chatId);
+        await sendPageScreenshot(chatId, session.page, 'Browser started successfully.');
+        return sendBrowserMenu(chatId);
+      }
+
+      if (pendingComputerRequests[chatId]) {
+        return bot.sendMessage(chatId, 'تم إرسال طلبك مسبقًا وهو بانتظار رد الأدمن.');
+      }
+
+      pendingComputerRequests[chatId] = {
+        requesterChatId: chatId,
+        name: `${query.from?.first_name || ''} ${query.from?.last_name || ''}`.trim() || 'Unknown',
+        username: query.from?.username ? '@' + query.from.username : 'No username',
+        createdAt: nowIso()
+      };
+
+      await bot.sendMessage(chatId, 'تم إرسال طلبك إلى الأدمن.');
+
+      return bot.sendMessage(ADMIN_ID, [
+        'شخصا طلب وضع الكمبيوتر!',
+        `اسمه: ${pendingComputerRequests[chatId].name}`,
+        `ايديه: ${chatId}`,
+        `معرفه التليجرام: ${pendingComputerRequests[chatId].username}`
+      ].join('\n'), {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'موافقة', callback_data: `approve_computer_${chatId}` },
+              { text: 'رفض', callback_data: `reject_computer_${chatId}` }
+            ]
+          ]
+        }
+      });
+    }
+
+    if (data.startsWith('approve_computer_')) {
+      if (!isAdmin(chatId)) return;
+
+      const requesterChatId = data.replace('approve_computer_', '');
+      const request = pendingComputerRequests[requesterChatId];
+      if (!request) {
+        return bot.sendMessage(chatId, 'الطلب لم يعد موجودًا.');
+      }
+
+      const requesterSession = getSession(requesterChatId);
+      requesterSession.approvedByAdmin = true;
+      approvedUsers[String(requesterChatId)] = {
+        approved: true,
+        approvedAt: nowIso(),
+        approvedBy: String(chatId)
+      };
+      saveApprovedUsers(approvedUsers);
+
+      await ensureBrowserSession(requesterChatId);
+      delete pendingComputerRequests[requesterChatId];
+
+      await bot.sendMessage(requesterChatId, 'تمت الموافقة على طلبك لفتح وضع الكمبيوتر.');
+      await sendPageScreenshot(requesterChatId, requesterSession.page, 'Browser started after admin approval.');
+      await sendBrowserMenu(requesterChatId);
+
+      return bot.sendMessage(chatId, `تمت الموافقة على الطلب للمستخدم ${requesterChatId}.`);
+    }
+
+    if (data.startsWith('reject_computer_')) {
+      if (!isAdmin(chatId)) return;
+
+      const requesterChatId = data.replace('reject_computer_', '');
+      if (pendingComputerRequests[requesterChatId]) {
+        delete pendingComputerRequests[requesterChatId];
+      }
+
+      await bot.sendMessage(requesterChatId, 'تم رفض طلب وضع الكمبيوتر.');
+      return bot.sendMessage(chatId, `تم رفض الطلب للمستخدم ${requesterChatId}.`);
+    }
+
+    // Guard: all browser actions require active page
+    if (!session.page) {
+      return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة. ابدأ وضع الكمبيوتر أولاً.');
+    }
+
+    if (data === 'browser_open_url') {
+      session.step = 'awaiting_url';
+      return bot.sendMessage(chatId, 'أرسل الرابط الآن.');
+    }
+
+    if (data === 'browser_refresh') {
+      await sendPageScreenshot(chatId, session.page, 'Current browser screen');
+      session.recorder.add('Screen refreshed', [
+        `Screenshot captured from URL: ${session.page.url()}`
+      ]);
+      return sendBrowserMenu(chatId, 'تم تحديث الشاشة.');
+    }
+
+    if (data === 'browser_enter') {
+      await session.page.keyboard.press('Enter');
+      session.recorder.add('Enter key pressed', [
+        `Action executed on URL: ${session.page.url()}`
+      ]);
+      return sendBrowserMenu(chatId, 'تم ضغط Enter.');
+    }
+
+    if (data === 'browser_type_text') {
+      session.step = 'awaiting_text_to_type';
+      return bot.sendMessage(chatId, 'أرسل النص الذي تريد كتابته.');
+    }
+
+    if (data === 'browser_scroll_down') {
+      await session.page.mouse.wheel(0, 850);
+      await sleep(250);
+      session.recorder.add('Scrolled down', [
+        `Scroll direction: down`,
+        `Approximate wheel delta: 850`,
+        `Current URL: ${session.page.url()}`
+      ]);
+      return sendBrowserMenu(chatId, 'تم النزول للأسفل.');
+    }
+
+    if (data === 'browser_scroll_up') {
+      await session.page.mouse.wheel(0, -850);
+      await sleep(250);
+      session.recorder.add('Scrolled up', [
+        `Scroll direction: up`,
+        `Approximate wheel delta: -850`,
+        `Current URL: ${session.page.url()}`
+      ]);
+      return sendBrowserMenu(chatId, 'تم الصعود للأعلى.');
+    }
+
+    if (data === 'browser_mouse_grid') {
+      const imagePath = path.join(os.tmpdir(), `grid_${Date.now()}.png`);
+      session.lastGrid = await renderMouseGridAndScreenshot(session.page, imagePath, 25, 40);
+      await bot.sendPhoto(chatId, imagePath, {
+        caption: `هذه شبكة الماوس.\nأرسل رقم المربع من 1 إلى ${session.lastGrid.totalCells} ليتم الضغط عليه.`
+      });
+      fs.unlinkSync(imagePath);
+      session.step = 'awaiting_grid_cell_number';
+      return;
+    }
+
+    if (data === 'browser_find_text_click') {
+      session.step = 'awaiting_search_text';
+      return bot.sendMessage(chatId, 'أرسل النص الذي تريد البحث عنه والضغط عليه.');
+    }
+
+    if (data === 'browser_find_text_click_clear') {
+      session.step = 'awaiting_search_text_click_clear';
+      return bot.sendMessage(chatId, 'أرسل النص الذي تريد البحث عنه ثم الضغط عليه ومسحه إذا كان حقل كتابة.');
+    }
+
+    if (data === 'browser_toggle_timer') {
+      if (!session.page) {
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة.');
+      }
+
+      if (!session.waitTimerStartedAt) {
+        session.waitTimerStartedAt = Date.now();
+        session.waitTimerPageUrl = session.page.url();
+        return sendBrowserMenu(chatId, 'بدأ تسجيل الوقت لهذه الصفحة. اضغط الزر مرة ثانية عند انتهاء الانتظار.');
+      }
+
+      const endedAt = Date.now();
+      const durationMs = endedAt - session.waitTimerStartedAt;
+      const startedIso = new Date(session.waitTimerStartedAt).toISOString();
+      const endedIso = new Date(endedAt).toISOString();
+      const startUrl = session.waitTimerPageUrl || session.page.url();
+      const endUrl = session.page.url();
+
+      session.recorder.add('Manual waiting time recorded', [
+        `Waiting started at: ${startedIso}`,
+        `Waiting ended at: ${endedIso}`,
+        `Total waiting duration: ${formatDuration(durationMs)}`,
+        `URL at timer start: ${startUrl}`,
+        `URL at timer stop: ${endUrl}`
+      ]);
+
+      session.waitTimerStartedAt = null;
+      session.waitTimerPageUrl = null;
+
+      return sendBrowserMenu(chatId, `تم حفظ مدة الانتظار داخل السكربت: ${formatDuration(durationMs)}`);
+    }
+
+    if (data === 'browser_save_end') {
+      if (session.recorder && session.waitTimerStartedAt) {
+        const endedAt = Date.now();
+        const durationMs = endedAt - session.waitTimerStartedAt;
+        const startedIso = new Date(session.waitTimerStartedAt).toISOString();
+        const endedIso = new Date(endedAt).toISOString();
+        const startUrl = session.waitTimerPageUrl || (session.page ? session.page.url() : '');
+        const endUrl = session.page ? session.page.url() : '';
+
+        session.recorder.add('Manual waiting time recorded automatically at session end', [
+          `Waiting started at: ${startedIso}`,
+          `Waiting ended at: ${endedIso}`,
+          `Total waiting duration: ${formatDuration(durationMs)}`,
+          `URL at timer start: ${startUrl}`,
+          `URL at timer stop: ${endUrl}`
+        ]);
+
+        session.waitTimerStartedAt = null;
+        session.waitTimerPageUrl = null;
+      }
+
+      const report = session.recorder ? session.recorder.finalize() : 'No session report.';
+      const fileName = `browser_session_${sanitizeFileName(chatId)}_${Date.now()}.txt`;
+      const filePath = path.join(os.tmpdir(), fileName);
+      fs.writeFileSync(filePath, report, 'utf8');
+
+      await closeBrowserSession(chatId);
+      await bot.sendDocument(chatId, filePath, {}, {
+        filename: fileName,
+        contentType: 'text/plain'
+      });
+      fs.unlinkSync(filePath);
+
+      return bot.sendMessage(chatId, 'تم حفظ التقرير وإنهاء الجلسة.', {
+        reply_markup: createHomeKeyboard(isAdmin(chatId), chatId)
+      });
+    }
+  } catch (error) {
+    console.error(error);
+    return bot.sendMessage(chatId, `حدث خطأ: ${error.message}`);
+  }
+});
+
+// --------------------------------------------------
+// 11) Text message handler
+// --------------------------------------------------
+bot.on('message', async (msg) => {
+  const chatId = String(msg.chat.id);
+  const text = (msg.text || '').trim();
+  if (!text || text.startsWith('/')) return;
+
+  const session = getSession(chatId);
+
+  try {
+    if (session.step === 'awaiting_url') {
+      if (!session.page) {
+        session.step = null;
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة.');
+      }
+
+      session.step = null;
+      const url = /^(https?:\/\/)/i.test(text) ? text : `https://${text}`;
+      await session.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      session.recorder.add('URL opened', [
+        `Requested URL: ${url}`,
+        `Final loaded URL: ${session.page.url()}`
+      ]);
+      await sendPageScreenshot(chatId, session.page, `Opened URL:\n${session.page.url()}`);
+      return sendBrowserMenu(chatId, 'تم فتح الرابط.');
+    }
+
+    if (session.step === 'awaiting_text_to_type') {
+      if (!session.page) {
+        session.step = null;
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة.');
+      }
+
+      session.step = null;
+      await typeLikeHuman(session.page, text);
+      session.recorder.add('Text typed like a human', [
+        `Typed text: ${JSON.stringify(text)}`,
+        'Typing mode: character by character',
+        `Current URL: ${session.page.url()}`
+      ]);
+      return sendBrowserMenu(chatId, 'تمت الكتابة بشكل بشري حرفًا حرفًا.');
+    }
+
+    if (session.step === 'awaiting_search_text') {
+      if (!session.page) {
+        session.step = null;
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة.');
+      }
+
+      session.step = null;
+      const result = await findTextAndClick(session.page, text);
+      if (!result.ok) {
+        session.recorder.add('Text search failed', [
+          `Requested text: ${JSON.stringify(text)}`,
+          `Current URL: ${session.page.url()}`
+        ]);
+        return sendBrowserMenu(chatId, 'لم أجد النص المطلوب على الشاشة الحالية.');
+      }
+
+      session.recorder.add('Text searched and clicked', [
+        `Requested text: ${JSON.stringify(text)}`,
+        `Clicked center coordinates: (${result.x.toFixed(2)}, ${result.y.toFixed(2)})`,
+        `Element size: ${result.width.toFixed(2)} x ${result.height.toFixed(2)}`,
+        `Current URL: ${session.page.url()}`
+      ]);
+
+      return sendBrowserMenu(chatId, `تم العثور على النص والضغط عليه:\n${text}`);
+    }
+
+    if (session.step === 'awaiting_search_text_click_clear') {
+      if (!session.page) {
+        session.step = null;
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة.');
+      }
+
+      session.step = null;
+      const result = await findTextClickAndClear(session.page, text);
+      if (!result.ok) {
+        session.recorder.add('Text search click and clear failed', [
+          `Requested text: ${JSON.stringify(text)}`,
+          `Current URL: ${session.page.url()}`
+        ]);
+        return sendBrowserMenu(chatId, 'لم أجد النص المطلوب أو لم أستطع مسحه.');
+      }
+
+      session.recorder.add('Text searched, clicked, and cleared', [
+        `Requested text: ${JSON.stringify(text)}`,
+        `Clicked center coordinates: (${result.x.toFixed(2)}, ${result.y.toFixed(2)})`,
+        `Element size: ${result.width.toFixed(2)} x ${result.height.toFixed(2)}`,
+        `Clear attempted: yes`,
+        `Clear success: ${result.cleared ? 'yes' : 'no'}`,
+        `Clear mode: ${result.clearMode}`,
+        `Current URL: ${session.page.url()}`
+      ]);
+
+      return sendBrowserMenu(chatId, result.cleared
+        ? 'تم العثور على النص والضغط عليه ومسحه.'
+        : 'تم العثور على النص والضغط عليه، لكن لم يتم مسحه بالكامل.');
+    }
+
+    if (session.step === 'awaiting_grid_cell_number') {
+      if (!session.page || !session.lastGrid) {
+        session.step = null;
+        return bot.sendMessage(chatId, 'لا توجد شبكة نشطة الآن.');
+      }
+
+      const num = Number(String(text).replace(/[^\d]/g, ''));
+      if (!num) {
+        return bot.sendMessage(chatId, 'أرسل رقم مربع صحيح.');
+      }
+
+      session.step = null;
+      const clickInfo = await clickGridCell(session.page, session.lastGrid, num);
+
+      session.recorder.add('Mouse grid cell clicked', [
+        `Selected grid cell number: ${clickInfo.cellNumber}`,
+        `Grid row: ${clickInfo.row}`,
+        `Grid column: ${clickInfo.col}`,
+        `Viewport coordinates clicked: (${clickInfo.x.toFixed(2)}, ${clickInfo.y.toFixed(2)})`,
+        `Absolute screen coordinates relative to page viewport and scroll: (${clickInfo.absoluteX.toFixed(2)}, ${clickInfo.absoluteY.toFixed(2)})`,
+        `Grid layout: ${session.lastGrid.cols} columns x ${session.lastGrid.rows} rows`,
+        `Current URL: ${session.page.url()}`
+      ]);
+
+      return sendBrowserMenu(chatId, [
+        'تم الضغط على المربع بنجاح.',
+        `رقم المربع: ${clickInfo.cellNumber}`,
+        `الإحداثيات داخل الشاشة: (${Math.round(clickInfo.x)}, ${Math.round(clickInfo.y)})`
+      ].join('\n'));
+    }
+  } catch (error) {
+    console.error(error);
+    session.step = null;
+    return bot.sendMessage(chatId, `حدث خطأ: ${error.message}`);
+  }
+});
+
+// --------------------------------------------------
+// 12) Clean shutdown
+// --------------------------------------------------
+async function closeAllSessions() {
+  const ids = Object.keys(sessions);
+  for (const id of ids) {
+    try {
+      await closeBrowserSession(id);
+    } catch (_) {}
+  }
+}
+
+process.on('SIGINT', async () => {
+  await closeAllSessions();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  await closeAllSessions();
+  process.exit(0);
+});
+
+process.on('uncaughtException', async (err) => {
+  console.error('uncaughtException:', err);
+});
+
+process.on('unhandledRejection', async (err) => {
+  console.error('unhandledRejection:', err);
+});
