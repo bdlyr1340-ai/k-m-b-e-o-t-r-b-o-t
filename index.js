@@ -83,7 +83,9 @@ sessions[chatId] = {
   step,
   lastGrid,
   recorder,
-  approvedByAdmin
+  approvedByAdmin,
+  waitTimerStartedAt,
+  waitTimerPageUrl
 }
 */
 const sessions = {};
@@ -120,7 +122,9 @@ function getSession(chatId) {
       step: null,
       lastGrid: null,
       recorder: null,
-      approvedByAdmin: false
+      approvedByAdmin: false,
+      waitTimerStartedAt: null,
+      waitTimerPageUrl: null
     };
   }
   return sessions[id];
@@ -154,8 +158,13 @@ function createKeyboard(isAdminUser) {
     [{ text: 'تحديث الشاشة', callback_data: 'browser_refresh' }],
     [{ text: 'انتر', callback_data: 'browser_enter' }],
     [{ text: 'كتابة نص', callback_data: 'browser_type_text' }],
+    [{ text: 'حذف نص', callback_data: 'browser_delete_text' }],
+    [{ text: 'نزول بسيط', callback_data: 'browser_scroll_down_small' }, { text: 'صعود بسيط', callback_data: 'browser_scroll_up_small' }],
+    [{ text: 'نزول للنهاية', callback_data: 'browser_scroll_down_end' }, { text: 'صعود للنهاية', callback_data: 'browser_scroll_up_end' }],
     [{ text: 'شبكة الماوس', callback_data: 'browser_mouse_grid' }],
     [{ text: 'البحث عن النص والضغط عليه', callback_data: 'browser_find_text_click' }],
+    [{ text: 'بحث عن النص والضغط عليه ومسحه', callback_data: 'browser_find_text_click_clear' }],
+    [{ text: 'تسجيل الوقت', callback_data: 'browser_toggle_timer' }],
     [{ text: 'حفظ وانهاء الجلسة', callback_data: 'browser_save_end' }]
   ];
 
@@ -257,6 +266,8 @@ async function ensureBrowserSession(chatId) {
   session.step = null;
   session.lastGrid = null;
   session.recorder = new ScriptRecorder(chatId);
+  session.waitTimerStartedAt = null;
+  session.waitTimerPageUrl = null;
 
   session.recorder.add('Browser session started', [
     `Initial URL opened: ${page.url()}`,
@@ -280,6 +291,11 @@ async function sendPageScreenshot(chatId, page, caption = 'Current screen') {
   fs.unlinkSync(filePath);
 }
 
+async function sendScreenAndMenu(chatId, page, caption = 'Current screen', menuText = 'تم تنفيذ الأمر.') {
+  await sendPageScreenshot(chatId, page, caption);
+  return sendBrowserMenu(chatId, menuText);
+}
+
 async function closeBrowserSession(chatId) {
   const session = getSession(chatId);
 
@@ -292,6 +308,8 @@ async function closeBrowserSession(chatId) {
   session.page = null;
   session.step = null;
   session.lastGrid = null;
+  session.waitTimerStartedAt = null;
+  session.waitTimerPageUrl = null;
 }
 
 // --------------------------------------------------
@@ -526,6 +544,53 @@ async function findTextAndClick(page, searchText) {
   };
 }
 
+
+
+async function deleteTextLikeHuman(page, count) {
+  const total = Math.max(1, Number(count) || 1);
+  for (let i = 0; i < total; i++) {
+    await sleep(35 + Math.floor(Math.random() * 90));
+    await page.keyboard.press('Backspace');
+    await sleep(25 + Math.floor(Math.random() * 85));
+  }
+  return total;
+}
+
+async function scrollHumanSimple(page, deltaY) {
+  const parts = 3 + Math.floor(Math.random() * 3);
+  const base = deltaY / parts;
+  for (let i = 0; i < parts; i++) {
+    const delta = base + (Math.random() - 0.5) * 60;
+    await page.mouse.wheel(0, delta);
+    await sleep(90 + Math.floor(Math.random() * 160));
+  }
+}
+
+async function scrollToExtreme(page, direction) {
+  const down = direction === 'down';
+  for (let i = 0; i < 18; i++) {
+    await page.mouse.wheel(0, down ? 1200 : -1200);
+    await sleep(100 + Math.floor(Math.random() * 120));
+  }
+
+  await page.evaluate((dir) => {
+    if (dir === 'down') {
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+    } else {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  }, direction).catch(() => {});
+  await sleep(600);
+}
+
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${hours}h ${minutes}m ${seconds}s`;
+}
+
 // --------------------------------------------------
 // 9) Start command
 // --------------------------------------------------
@@ -553,15 +618,13 @@ bot.on('callback_query', async (query) => {
       }
 
       await ensureBrowserSession(chatId);
-      await sendPageScreenshot(chatId, session.page, 'Browser started successfully.');
-      return sendBrowserMenu(chatId);
+      return sendScreenAndMenu(chatId, session.page, 'Browser started successfully.', 'تم فتح وضع الكمبيوتر.');
     }
 
     if (data === 'request_computer_mode') {
       if (isAdmin(chatId) || approvedUsers[String(chatId)]) {
         await ensureBrowserSession(chatId);
-        await sendPageScreenshot(chatId, session.page, 'Browser started successfully.');
-        return sendBrowserMenu(chatId);
+        return sendScreenAndMenu(chatId, session.page, 'Browser started successfully.', 'تم فتح وضع الكمبيوتر.');
       }
 
       if (pendingComputerRequests[chatId]) {
@@ -616,8 +679,7 @@ bot.on('callback_query', async (query) => {
       delete pendingComputerRequests[requesterChatId];
 
       await bot.sendMessage(requesterChatId, 'تمت الموافقة على طلبك لفتح وضع الكمبيوتر.');
-      await sendPageScreenshot(requesterChatId, requesterSession.page, 'Browser started after admin approval.');
-      await sendBrowserMenu(requesterChatId);
+      await sendScreenAndMenu(requesterChatId, requesterSession.page, 'Browser started after admin approval.', 'تم فتح وضع الكمبيوتر.');
 
       return bot.sendMessage(chatId, `تمت الموافقة على الطلب للمستخدم ${requesterChatId}.`);
     }
@@ -645,11 +707,10 @@ bot.on('callback_query', async (query) => {
     }
 
     if (data === 'browser_refresh') {
-      await sendPageScreenshot(chatId, session.page, 'Current browser screen');
       session.recorder.add('Screen refreshed', [
         `Screenshot captured from URL: ${session.page.url()}`
       ]);
-      return sendBrowserMenu(chatId, 'تم تحديث الشاشة.');
+      return sendScreenAndMenu(chatId, session.page, 'Current browser screen', 'تم تحديث الشاشة.');
     }
 
     if (data === 'browser_enter') {
@@ -657,12 +718,57 @@ bot.on('callback_query', async (query) => {
       session.recorder.add('Enter key pressed', [
         `Action executed on URL: ${session.page.url()}`
       ]);
-      return sendBrowserMenu(chatId, 'تم ضغط Enter.');
+      return sendScreenAndMenu(chatId, session.page, 'After pressing Enter', 'تم ضغط Enter.');
     }
 
     if (data === 'browser_type_text') {
       session.step = 'awaiting_text_to_type';
-      return bot.sendMessage(chatId, 'أرسل النص الذي تريد كتابته.');
+      return bot.sendMessage(chatId, 'أرسل النص الذي تريد كتابته حرفًا حرفًا.');
+    }
+
+    if (data === 'browser_delete_text') {
+      session.step = 'awaiting_delete_text_count';
+      return bot.sendMessage(chatId, 'أرسل عدد الأحرف التي تريد حذفها. مثال: 6');
+    }
+
+    if (data === 'browser_scroll_down_small') {
+      await scrollHumanSimple(session.page, 700);
+      session.recorder.add('Scrolled down slightly', [
+        `Scroll direction: down`,
+        `Scroll style: slight human-like scroll`,
+        `Current URL: ${session.page.url()}`
+      ]);
+      return sendScreenAndMenu(chatId, session.page, 'After slight scroll down', 'تم النزول البسيط.');
+    }
+
+    if (data === 'browser_scroll_up_small') {
+      await scrollHumanSimple(session.page, -700);
+      session.recorder.add('Scrolled up slightly', [
+        `Scroll direction: up`,
+        `Scroll style: slight human-like scroll`,
+        `Current URL: ${session.page.url()}`
+      ]);
+      return sendScreenAndMenu(chatId, session.page, 'After slight scroll up', 'تم الصعود البسيط.');
+    }
+
+    if (data === 'browser_scroll_down_end') {
+      await scrollToExtreme(session.page, 'down');
+      session.recorder.add('Scrolled to page bottom', [
+        `Scroll direction: down`,
+        `Scroll target: page bottom`,
+        `Current URL: ${session.page.url()}`
+      ]);
+      return sendScreenAndMenu(chatId, session.page, 'Reached page bottom', 'تم النزول للنهاية.');
+    }
+
+    if (data === 'browser_scroll_up_end') {
+      await scrollToExtreme(session.page, 'up');
+      session.recorder.add('Scrolled to page top', [
+        `Scroll direction: up`,
+        `Scroll target: page top`,
+        `Current URL: ${session.page.url()}`
+      ]);
+      return sendScreenAndMenu(chatId, session.page, 'Reached page top', 'تم الصعود للنهاية.');
     }
 
     if (data === 'browser_mouse_grid') {
@@ -681,7 +787,59 @@ bot.on('callback_query', async (query) => {
       return bot.sendMessage(chatId, 'أرسل النص الذي تريد البحث عنه والضغط عليه.');
     }
 
+    if (data === 'browser_toggle_timer') {
+      if (!session.page) {
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة.');
+      }
+
+      if (!session.waitTimerStartedAt) {
+        session.waitTimerStartedAt = Date.now();
+        session.waitTimerPageUrl = session.page.url();
+        return sendScreenAndMenu(chatId, session.page, 'Timer started on current page', 'بدأ تسجيل الوقت لهذه الصفحة. اضغط الزر مرة ثانية عند انتهاء الانتظار.');
+      }
+
+      const endedAt = Date.now();
+      const durationMs = endedAt - session.waitTimerStartedAt;
+      const startedIso = new Date(session.waitTimerStartedAt).toISOString();
+      const endedIso = new Date(endedAt).toISOString();
+      const startUrl = session.waitTimerPageUrl || session.page.url();
+      const endUrl = session.page.url();
+
+      session.recorder.add('Manual waiting time recorded', [
+        `Waiting started at: ${startedIso}`,
+        `Waiting ended at: ${endedIso}`,
+        `Total waiting duration: ${formatDuration(durationMs)}`,
+        `URL at timer start: ${startUrl}`,
+        `URL at timer stop: ${endUrl}`
+      ]);
+
+      session.waitTimerStartedAt = null;
+      session.waitTimerPageUrl = null;
+
+      return sendScreenAndMenu(chatId, session.page, 'Timer stopped on current page', `تم حفظ مدة الانتظار داخل السكربت: ${formatDuration(durationMs)}`);
+    }
+
     if (data === 'browser_save_end') {
+      if (session.recorder && session.waitTimerStartedAt) {
+        const endedAt = Date.now();
+        const durationMs = endedAt - session.waitTimerStartedAt;
+        const startedIso = new Date(session.waitTimerStartedAt).toISOString();
+        const endedIso = new Date(endedAt).toISOString();
+        const startUrl = session.waitTimerPageUrl || (session.page ? session.page.url() : '');
+        const endUrl = session.page ? session.page.url() : '';
+
+        session.recorder.add('Manual waiting time recorded automatically at session end', [
+          `Waiting started at: ${startedIso}`,
+          `Waiting ended at: ${endedIso}`,
+          `Total waiting duration: ${formatDuration(durationMs)}`,
+          `URL at timer start: ${startUrl}`,
+          `URL at timer stop: ${endUrl}`
+        ]);
+
+        session.waitTimerStartedAt = null;
+        session.waitTimerPageUrl = null;
+      }
+
       const report = session.recorder ? session.recorder.finalize() : 'No session report.';
       const fileName = `browser_session_${sanitizeFileName(chatId)}_${Date.now()}.txt`;
       const filePath = path.join(os.tmpdir(), fileName);
@@ -745,7 +903,7 @@ bot.on('message', async (msg) => {
         'Typing mode: character by character',
         `Current URL: ${session.page.url()}`
       ]);
-      return sendBrowserMenu(chatId, 'تمت الكتابة بشكل بشري حرفًا حرفًا.');
+      return sendScreenAndMenu(chatId, session.page, 'After human-like typing', 'تمت الكتابة بشكل بشري حرفًا حرفًا.');
     }
 
     if (session.step === 'awaiting_search_text') {
@@ -761,7 +919,7 @@ bot.on('message', async (msg) => {
           `Requested text: ${JSON.stringify(text)}`,
           `Current URL: ${session.page.url()}`
         ]);
-        return sendBrowserMenu(chatId, 'لم أجد النص المطلوب على الشاشة الحالية.');
+        return sendScreenAndMenu(chatId, session.page, 'Text search failed on current screen', 'لم أجد النص المطلوب على الشاشة الحالية.');
       }
 
       session.recorder.add('Text searched and clicked', [
@@ -798,11 +956,16 @@ bot.on('message', async (msg) => {
         `Current URL: ${session.page.url()}`
       ]);
 
-      return sendBrowserMenu(chatId, [
-        'تم الضغط على المربع بنجاح.',
-        `رقم المربع: ${clickInfo.cellNumber}`,
-        `الإحداثيات داخل الشاشة: (${Math.round(clickInfo.x)}, ${Math.round(clickInfo.y)})`
-      ].join('\n'));
+      return sendScreenAndMenu(
+        chatId,
+        session.page,
+        `Clicked grid cell ${clickInfo.cellNumber}`,
+        [
+          'تم الضغط على المربع بنجاح.',
+          `رقم المربع: ${clickInfo.cellNumber}`,
+          `الإحداثيات داخل الشاشة: (${Math.round(clickInfo.x)}, ${Math.round(clickInfo.y)})`
+        ].join('\n')
+      );
     }
   } catch (error) {
     console.error(error);
