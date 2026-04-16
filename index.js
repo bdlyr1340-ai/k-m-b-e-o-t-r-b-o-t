@@ -80,12 +80,13 @@ sessions[chatId] = {
   browser,
   context,
   page,
-  step,
+  step, // Current interaction step (e.g., awaiting_url, awaiting_text_to_type)
   lastGrid,
   recorder,
   approvedByAdmin,
   waitTimerStartedAt,
-  waitTimerPageUrl
+  waitTimerPageUrl,
+  expectingVerificationCode // NEW: To handle 2FA/OTP screens
 }
 */
 const sessions = {};
@@ -124,7 +125,10 @@ function getSession(chatId) {
       recorder: null,
       approvedByAdmin: false,
       waitTimerStartedAt: null,
-      waitTimerPageUrl: null
+      waitTimerPageUrl: null,
+      // --- إضافة جديدة: حالة لمعالجة كود التحقق ---
+      expectingVerificationCode: false
+      // ------------------------------------------
     };
   }
   return sessions[id];
@@ -163,7 +167,9 @@ function createKeyboard(isAdminUser) {
     [{ text: 'نزول للنهاية', callback_data: 'browser_scroll_down_end' }, { text: 'صعود للنهاية', callback_data: 'browser_scroll_up_end' }],
     [{ text: 'شبكة الماوس', callback_data: 'browser_mouse_grid' }],
     [{ text: 'البحث عن النص والضغط عليه', callback_data: 'browser_find_text_click' }],
-    [{ text: 'بحث عن النص والضغط عليه ومسحه', callback_data: 'browser_find_text_click_clear' }],
+    // --- إضافة جديدة: زر لاكتشاف كود التحقق ---
+    [{ text: 'اكتشاف كود التحقق', callback_data: 'browser_detect_verification_code' }],
+    // ------------------------------------------
     [{ text: 'تسجيل الوقت', callback_data: 'browser_toggle_timer' }],
     [{ text: 'حفظ وانهاء الجلسة', callback_data: 'browser_save_end' }]
   ];
@@ -232,6 +238,51 @@ class ScriptRecorder {
 // --------------------------------------------------
 // 7) Browser session helpers
 // --------------------------------------------------
+
+// --- إضافة جديدة: معالجة شريط الكوكيز (Cookie Banner) ---
+async function handleCookieBanner(page) {
+  try {
+    const acceptButtons = [
+      'Accept all cookies',
+      'Accept Cookies',
+      'Accept',
+      'Agree',
+      'موافق', // Arabic
+      'قبول', // Arabic
+      'Got it',
+      'Continue',
+      'I understand',
+      'Alle Cookies zulassen' // German
+    ];
+
+    for (const btnText of acceptButtons) {
+      // Find buttons by text, case-insensitive, and ensure they are visible
+      const button = page.locator(`button:has-text("${btnText}" i), a:has-text("${btnText}" i)`).first();
+      
+      // Check if button is visible and enabled
+      if (await button.isVisible() && await button.isEnabled()) {
+        console.log(`[Bot] Attempting to click cookie button: "${btnText}"`);
+        await button.click({ timeout: 5000 }); // Click with a short timeout
+        await sleep(1500); // Give time for banner to disappear
+        return true;
+      }
+    }
+    // Check for common "X" or "Close" buttons for banners
+    const closeButton = page.locator('button[aria-label*="Close" i], button[title*="Close" i], [aria-label*="Close" i] svg').first();
+    if (await closeButton.isVisible() && await closeButton.isEnabled()) {
+        console.log("[Bot] Attempting to close cookie banner with 'X' button.");
+        await closeButton.click({ timeout: 5000 });
+        await sleep(1500);
+        return true;
+    }
+
+  } catch (error) {
+    // console.log(`[Bot] No cookie banner or failed to click: ${error.message}`);
+  }
+  return false;
+}
+// ----------------------------------------------------------
+
 async function ensureBrowserSession(chatId) {
   const session = getSession(chatId);
 
@@ -248,17 +299,24 @@ async function ensureBrowserSession(chatId) {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-blink-features=AutomationControlled',
-      '--disable-dev-shm-usage'
+      '--disable-dev-shm-usage',
+      '--lang=en-US,en', // Set language to English (or your preferred language)
+      // '--proxy-server=http://your_proxy_ip:port' // Uncomment and configure if you need a proxy
     ]
   });
 
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    locale: 'en-US' // Set context locale
   });
 
   const page = await context.newPage();
-  await page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 45000 }); // Changed to Google for a cleaner start
+
+  // --- إضافة جديدة: معالجة شريط الكوكيز عند فتح المتصفح لأول مرة ---
+  await handleCookieBanner(page);
+  // ---------------------------------------------------------------
 
   session.browser = browser;
   session.context = context;
@@ -268,6 +326,7 @@ async function ensureBrowserSession(chatId) {
   session.recorder = new ScriptRecorder(chatId);
   session.waitTimerStartedAt = null;
   session.waitTimerPageUrl = null;
+  session.expectingVerificationCode = false; // Reset state
 
   session.recorder.add('Browser session started', [
     `Initial URL opened: ${page.url()}`,
@@ -310,6 +369,7 @@ async function closeBrowserSession(chatId) {
   session.lastGrid = null;
   session.waitTimerStartedAt = null;
   session.waitTimerPageUrl = null;
+  session.expectingVerificationCode = false; // Reset state
 }
 
 // --------------------------------------------------
@@ -470,60 +530,63 @@ async function clickGridCell(page, grid, cellNumber) {
 }
 
 async function findTextAndClick(page, searchText) {
-  const escaped = String(searchText).replace(/"/g, '\\"');
+  // Try Playwright's built-in text locators first, as they are robust
   const locators = [
-    page.locator(`text="${searchText}"`).first(),
     page.getByText(searchText, { exact: true }).first(),
-    page.getByText(searchText).first()
+    page.getByText(searchText).first(),
+    page.locator(`text="${searchText}"`).first(), // Fallback to raw text selector
   ];
 
   for (const locator of locators) {
     try {
-      const count = await locator.count().catch(() => 0);
-      if (!count) continue;
+      // Ensure element is visible and enabled
+      if (await locator.isVisible({ timeout: 2000 }) && await locator.isEnabled({ timeout: 2000 })) {
+        await locator.scrollIntoViewIfNeeded().catch(() => {});
+        await sleep(350);
 
-      await locator.scrollIntoViewIfNeeded().catch(() => {});
-      await sleep(350);
+        const box = await locator.boundingBox();
+        if (!box) continue; // If no box, it's not truly visible/interactive
 
-      const box = await locator.boundingBox();
-      if (!box) continue;
+        const centerX = box.x + box.width / 2;
+        const centerY = box.y + box.height / 2;
 
-      const centerX = box.x + box.width / 2;
-      const centerY = box.y + box.height / 2;
+        await moveMouseLikeHuman(page, centerX, centerY);
+        await sleep(100 + Math.floor(Math.random() * 150));
+        await page.mouse.click(centerX, centerY, { delay: 40 + Math.floor(Math.random() * 120) });
 
-      await moveMouseLikeHuman(page, centerX, centerY);
-      await sleep(100 + Math.floor(Math.random() * 150));
-      await page.mouse.click(centerX, centerY, { delay: 40 + Math.floor(Math.random() * 120) });
-
-      return {
-        ok: true,
-        text: searchText,
-        x: centerX,
-        y: centerY,
-        width: box.width,
-        height: box.height
-      };
-    } catch (_) {}
+        return {
+          ok: true,
+          text: searchText,
+          x: centerX,
+          y: centerY,
+          width: box.width,
+          height: box.height
+        };
+      }
+    } catch (_) { /* continue to next locator or fallback */ }
   }
 
-  // Fallback DOM search
+  // Fallback to a more generic DOM search (less reliable but covers more cases)
   const fallback = await page.evaluate((needle) => {
-    const all = Array.from(document.querySelectorAll('button, a, span, div, p, li, input, textarea'));
-    const target = all.find(el => {
-      const text = (el.innerText || el.value || '').trim();
+    const allElements = Array.from(document.querySelectorAll('button, a, span, div, p, li, input, textarea, label'));
+    for (const el of allElements) {
+      const textContent = (el.innerText || el.value || el.textContent || '').trim();
       const rect = el.getBoundingClientRect();
-      return text && text.toLowerCase().includes(String(needle).toLowerCase()) && rect.width > 0 && rect.height > 0;
-    });
-
-    if (!target) return null;
-    target.scrollIntoView({ block: 'center', inline: 'center' });
-    const rect = target.getBoundingClientRect();
-    return {
-      x: rect.left + rect.width / 2,
-      y: rect.top + rect.height / 2,
-      width: rect.width,
-      height: rect.height
-    };
+      
+      // Check if text matches and element is reasonably visible/sized
+      if (textContent && textContent.toLowerCase().includes(String(needle).toLowerCase()) && rect.width > 0 && rect.height > 0) {
+        // Try to scroll into view if not already
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+        const scrolledRect = el.getBoundingClientRect(); // Get updated rect after scroll
+        return {
+          x: scrolledRect.left + scrolledRect.width / 2,
+          y: scrolledRect.top + scrolledRect.height / 2,
+          width: scrolledRect.width,
+          height: scrolledRect.height
+        };
+      }
+    }
+    return null;
   }, searchText);
 
   if (!fallback) {
@@ -544,6 +607,46 @@ async function findTextAndClick(page, searchText) {
   };
 }
 
+// --- إضافة جديدة: دالة لتعبئة حقول الإدخال بناءً على النص المجاور أو الـ placeholder ---
+async function fillInputByLabelOrPlaceholder(page, identifyingText, valueToType) {
+  // First, try by placeholder
+  try {
+    const inputByPlaceholder = page.locator(`input[placeholder*="${identifyingText}" i]`).first();
+    if (await inputByPlaceholder.isVisible({ timeout: 1000 })) {
+      await inputByPlaceholder.focus();
+      await inputByPlaceholder.fill(''); // Clear existing value
+      await typeLikeHuman(page, valueToType);
+      return { ok: true, type: 'placeholder', locator: inputByPlaceholder };
+    }
+  } catch (e) {}
+
+  // Then, try by associated label or parent text (more robust)
+  try {
+    const locator = page.locator(`input[aria-label*="${identifyingText}" i], input[id=(//label[contains(., "${identifyingText}") or contains(@for, "${identifyingText}") or contains(@for, "code") or contains(@for, "otp")]/@for)], input:has( + label:has-text("${identifyingText}" i)), input:below(label:has-text("${identifyingText}" i))`).first();
+    if (await locator.isVisible({ timeout: 1000 })) {
+      await locator.focus();
+      await locator.fill('');
+      await typeLikeHuman(page, valueToType);
+      return { ok: true, type: 'label/parent', locator: locator };
+    }
+  } catch (e) {}
+
+  // Generic input field near "code" text
+  try {
+    const locator = page.locator(`input[type="text"], input[type="number"], input[type="password"]`)
+                       .filter({ hasText: /code|otp|رمز/i }) // Check if any nearby text contains these
+                       .first();
+    if (await locator.isVisible({ timeout: 1000 })) {
+      await locator.focus();
+      await locator.fill('');
+      await typeLikeHuman(page, valueToType);
+      return { ok: true, type: 'generic_nearby', locator: locator };
+    }
+  } catch (e) {}
+
+  return { ok: false };
+}
+// -----------------------------------------------------------------------------------
 
 
 async function deleteTextLikeHuman(page, count) {
@@ -703,6 +806,9 @@ bot.on('callback_query', async (query) => {
 
     if (data === 'browser_open_url') {
       session.step = 'awaiting_url';
+      // --- إضافة جديدة: إعادة ضبط حالة انتظار الكود عند تغيير الرابط ---
+      session.expectingVerificationCode = false; 
+      // -------------------------------------------------------------
       return bot.sendMessage(chatId, 'أرسل الرابط الآن.');
     }
 
@@ -787,6 +893,26 @@ bot.on('callback_query', async (query) => {
       return bot.sendMessage(chatId, 'أرسل النص الذي تريد البحث عنه والضغط عليه.');
     }
 
+    // --- إضافة جديدة: معالجة اكتشاف كود التحقق ---
+    if (data === 'browser_detect_verification_code') {
+      if (!session.page) {
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة.');
+      }
+      
+      const pageContent = await session.page.content();
+      const keywords = ['code', 'otp', 'verification', 'رمز', 'تحقق'];
+      const foundKeyword = keywords.some(keyword => pageContent.toLowerCase().includes(keyword));
+
+      if (foundKeyword) {
+        session.expectingVerificationCode = true;
+        session.step = null; // Clear any other step
+        return bot.sendMessage(chatId, '✅ تم اكتشاف كلمات مفتاحية تشير إلى كود التحقق.\nالآن، أرسل لي الكود الذي وصلك عبر البريد الإلكتروني أو الرسائل النصية، وسأحاول إدخاله.');
+      } else {
+        return bot.sendMessage(chatId, '❌ لم يتم اكتشاف كلمات مفتاحية تشير إلى كود التحقق في الصفحة الحالية.');
+      }
+    }
+    // ------------------------------------------
+
     if (data === 'browser_toggle_timer') {
       if (!session.page) {
         return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة.');
@@ -857,7 +983,12 @@ bot.on('callback_query', async (query) => {
       });
     }
   } catch (error) {
-    console.error(error);
+    console.error(`Error in callback query for chat ${chatId}:`, error);
+    // Ensure the step is cleared on error
+    if (session) {
+      session.step = null;
+      session.expectingVerificationCode = false;
+    }
     return bot.sendMessage(chatId, `حدث خطأ: ${error.message}`);
   }
 });
@@ -868,11 +999,71 @@ bot.on('callback_query', async (query) => {
 bot.on('message', async (msg) => {
   const chatId = String(msg.chat.id);
   const text = (msg.text || '').trim();
-  if (!text || text.startsWith('/')) return;
+  if (!text || text.startsWith('/')) {
+    // If it's a command, let the command handler deal with it.
+    // If it's empty, ignore.
+    return;
+  }
 
   const session = getSession(chatId);
 
   try {
+    // --- إضافة جديدة: معالجة إدخال كود التحقق ---
+    if (session.expectingVerificationCode) {
+      if (!session.page) {
+        session.expectingVerificationCode = false;
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة لإدخال الكود.');
+      }
+
+      const verificationCode = text;
+      session.expectingVerificationCode = false; // Reset state immediately
+
+      const fillResult = await fillInputByLabelOrPlaceholder(session.page, 'code', verificationCode);
+      
+      let clickResult = { ok: false };
+      if (fillResult.ok) {
+        // Try to click a "Continue", "Submit", "Verify" button after filling
+        clickResult = await findTextAndClick(session.page, 'Continue');
+        if (!clickResult.ok) { // Try other common submit texts
+            clickResult = await findTextAndClick(session.page, 'Submit');
+        }
+        if (!clickResult.ok) {
+            clickResult = await findTextAndClick(session.page, 'Verify');
+        }
+        if (!clickResult.ok) { // Arabic buttons
+            clickResult = await findTextAndClick(session.page, 'متابعة');
+        }
+        if (!clickResult.ok) {
+            clickResult = await findTextAndClick(session.page, 'إرسال');
+        }
+        if (!clickResult.ok) {
+            clickResult = await findTextAndClick(session.page, 'تأكيد');
+        }
+      }
+
+      if (fillResult.ok && clickResult.ok) {
+        session.recorder.add('Verification code entered and submitted', [
+          `Code entered: ${JSON.stringify(verificationCode)}`,
+          `Submit button clicked: ${clickResult.text}`,
+          `URL: ${session.page.url()}`
+        ]);
+        return sendScreenAndMenu(chatId, session.page, 'After code submission', 'تم إدخال الكود والضغط على زر المتابعة.');
+      } else if (fillResult.ok) {
+        session.recorder.add('Verification code entered, but submit button not clicked', [
+          `Code entered: ${JSON.stringify(verificationCode)}`,
+          `URL: ${session.page.url()}`
+        ]);
+        return sendScreenAndMenu(chatId, session.page, 'After code input', 'تم إدخال الكود بنجاح، ولكن لم يتم العثور على زر المتابعة. يرجى الضغط عليه يدوياً أو استخدام شبكة الماوس.');
+      } else {
+        session.recorder.add('Failed to enter verification code', [
+          `Code attempted: ${JSON.stringify(verificationCode)}`,
+          `URL: ${session.page.url()}`
+        ]);
+        return sendScreenAndMenu(chatId, session.page, 'Error inputting code', 'فشل في العثور على حقل إدخال الكود. يرجى المحاولة باستخدام شبكة الماوس أو تحديد الحقل يدوياً.');
+      }
+    }
+    // -----------------------------------------------------
+
     if (session.step === 'awaiting_url') {
       if (!session.page) {
         session.step = null;
@@ -881,7 +1072,10 @@ bot.on('message', async (msg) => {
 
       session.step = null;
       const url = /^(https?:\/\/)/i.test(text) ? text : `https://${text}`;
-      await session.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await session.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }); // Increased timeout
+      // --- إضافة جديدة: معالجة شريط الكوكيز بعد الانتقال إلى رابط جديد ---
+      await handleCookieBanner(session.page);
+      // ---------------------------------------------------------------
       session.recorder.add('URL opened', [
         `Requested URL: ${url}`,
         `Final loaded URL: ${session.page.url()}`
@@ -929,7 +1123,25 @@ bot.on('message', async (msg) => {
         `Current URL: ${session.page.url()}`
       ]);
 
-      return sendBrowserMenu(chatId, `تم العثور على النص والضغط عليه:\n${text}`);
+      return sendScreenAndMenu(chatId, session.page, `Clicked: ${text}`, `تم العثور على النص والضغط عليه:\n${text}`);
+    }
+    
+    if (session.step === 'awaiting_delete_text_count') {
+      if (!session.page) {
+        session.step = null;
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة.');
+      }
+      const count = Number(text);
+      if (isNaN(count) || count <= 0) {
+        return bot.sendMessage(chatId, 'الرجاء إرسال عدد صحيح موجب.');
+      }
+      session.step = null;
+      await deleteTextLikeHuman(session.page, count);
+      session.recorder.add('Text deleted like a human', [
+        `Number of characters deleted: ${count}`,
+        `Current URL: ${session.page.url()}`
+      ]);
+      return sendScreenAndMenu(chatId, session.page, 'After deleting text', `تم حذف ${count} حرفًا.`);
     }
 
     if (session.step === 'awaiting_grid_cell_number') {
@@ -939,8 +1151,8 @@ bot.on('message', async (msg) => {
       }
 
       const num = Number(String(text).replace(/[^\d]/g, ''));
-      if (!num) {
-        return bot.sendMessage(chatId, 'أرسل رقم مربع صحيح.');
+      if (!num || num < 1 || num > session.lastGrid.totalCells) {
+        return bot.sendMessage(chatId, `أرسل رقم مربع صحيح بين 1 و ${session.lastGrid.totalCells}.`);
       }
 
       session.step = null;
@@ -967,9 +1179,26 @@ bot.on('message', async (msg) => {
         ].join('\n')
       );
     }
+
+    // --- إذا لم يطابق أي من الحالات أعلاه، فقد تكون رسالة عادية لا تتطلب تفاعلاً خاصاً ---
+    // يمكنك إضافة منطق للتعامل مع الرسائل العادية هنا إذا لزم الأمر
+    // For now, if no step is active, just ignore.
+    if (!session.step && !session.expectingVerificationCode) {
+      console.log(`[Bot] Received unhandled message from ${chatId}: "${text}"`);
+      // Optionally, send a message back:
+      // return bot.sendMessage(chatId, 'لم أفهم طلبك. الرجاء استخدام الأزرار أو بدء مهمة محددة.', {
+      //   reply_markup: createKeyboard(isAdmin(chatId))
+      // });
+    }
+    // ---------------------------------------------------------------------------------
+
   } catch (error) {
-    console.error(error);
-    session.step = null;
+    console.error(`Error in message handler for chat ${chatId}:`, error);
+    // Ensure step and verification state are cleared on error
+    if (session) {
+      session.step = null;
+      session.expectingVerificationCode = false;
+    }
     return bot.sendMessage(chatId, `حدث خطأ: ${error.message}`);
   }
 });
@@ -987,17 +1216,24 @@ async function closeAllSessions() {
 }
 
 process.on('SIGINT', async () => {
+  console.log('SIGINT received. Closing all browser sessions...');
   await closeAllSessions();
+  console.log('All sessions closed. Exiting.');
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
+  console.log('SIGTERM received. Closing all browser sessions...');
   await closeAllSessions();
+  console.log('All sessions closed. Exiting.');
   process.exit(0);
 });
 
 process.on('uncaughtException', async (err) => {
   console.error('uncaughtException:', err);
+  // Optionally, try to close sessions even on uncaught exceptions
+  // await closeAllSessions();
+  // process.exit(1);
 });
 
 process.on('unhandledRejection', async (err) => {
