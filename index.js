@@ -148,6 +148,7 @@ function getSession(chatId) {
       // --- إضافة جديدة: حالة لمعالجة كود التحقق ---
       expectingVerificationCode: false,
       // ------------------------------------------
+      tempUrl: null,
 
       // PATCH: grid settings (default 25x40 = 1000 cells)
       gridCols: 25,
@@ -429,6 +430,7 @@ async function ensureBrowserSession(chatId) {
   session.waitTimerStartedAt = null;
   session.waitTimerPageUrl = null;
   session.expectingVerificationCode = false;
+  session.tempUrl = null;
 
   session.recorder.add('Browser session started', [
     `Initial URL opened: ${page.url()}`,
@@ -482,6 +484,7 @@ async function closeBrowserSession(chatId) {
   session.waitTimerStartedAt = null;
   session.waitTimerPageUrl = null;
   session.expectingVerificationCode = false;
+  session.tempUrl = null;
 }
 
 // --------------------------------------------------
@@ -908,6 +911,29 @@ bot.on('callback_query', async (query) => {
       return bot.sendMessage(chatId, 'أرسل الرابط الآن.');
     }
 
+    if (data === 'browser_add_cookie') {
+      if (!session.tempUrl) return bot.sendMessage(chatId, 'لا يوجد رابط محفوظ.');
+      session.step = 'awaiting_cookie_data';
+      return bot.sendMessage(chatId, 'أرسل بيانات الكوكيز الآن (يجب أن تكون بصيغة مصفوفة JSON المستخرجة من الإضافة).');
+    }
+
+    if (data === 'browser_skip_cookie') {
+      if (!session.tempUrl) return bot.sendMessage(chatId, 'لا يوجد رابط محفوظ.');
+      const url = session.tempUrl;
+      session.tempUrl = null;
+
+      await bot.sendMessage(chatId, 'جاري فتح الرابط...');
+      await session.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await handleCookieBanner(session.page);
+
+      session.recorder?.add('URL opened (without custom cookies)', [
+        `Requested URL: ${url}`,
+        `Final loaded URL: ${session.page.url()}`
+      ]);
+      await sendPageScreenshot(chatId, session.page, `Opened URL:\n${session.page.url()}`);
+      return sendBrowserMenu(chatId, 'تم فتح الرابط.');
+    }
+
     // PATCH: back button
     if (data === 'browser_back') {
       await session.page.goBack({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => null);
@@ -1245,15 +1271,51 @@ bot.on('message', async (msg) => {
 
       session.step = null;
       const url = /^(https?:\/\/)/i.test(text) ? text : `https://${text}`;
+      
+      session.tempUrl = url;
+      
+      return bot.sendMessage(chatId, 'هل تريد إضافة كوكيز (Cookies) مع هذا الرابط قبل فتحه؟', {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: 'نعم، إضافة كوكيز 🍪', callback_data: 'browser_add_cookie' }],
+            [{ text: 'لا، افتح الرابط مباشرة 🌐', callback_data: 'browser_skip_cookie' }]
+          ]
+        }
+      });
+    }
+
+    if (session.step === 'awaiting_cookie_data') {
+      if (!session.page || !session.tempUrl) {
+        session.step = null;
+        session.tempUrl = null;
+        return bot.sendMessage(chatId, 'لا توجد جلسة متصفح فعالة أو تم فقدان الرابط.');
+      }
+
+      session.step = null;
+      const url = session.tempUrl;
+      session.tempUrl = null;
+
+      try {
+        const cookies = JSON.parse(text);
+        if (Array.isArray(cookies)) {
+          await session.context.addCookies(cookies);
+          await bot.sendMessage(chatId, '✅ تمت إضافة الكوكيز بنجاح. جاري فتح الرابط...');
+        } else {
+          return bot.sendMessage(chatId, '❌ فشل: الكوكيز يجب أن تكون بصيغة مصفوفة JSON صالحة. افتح الرابط وحاول من جديد.');
+        }
+      } catch (e) {
+        return bot.sendMessage(chatId, '❌ حدث خطأ في قراءة الكوكيز (تأكد من صيغة JSON وأنها غير ناقصة). افتح الرابط وحاول من جديد.');
+      }
+
       await session.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await handleCookieBanner(session.page);
 
-      session.recorder?.add('URL opened', [
+      session.recorder?.add('URL opened with custom cookies', [
         `Requested URL: ${url}`,
         `Final loaded URL: ${session.page.url()}`
       ]);
-      await sendPageScreenshot(chatId, session.page, `Opened URL:\n${session.page.url()}`);
-      return sendBrowserMenu(chatId, 'تم فتح الرابط.');
+      await sendPageScreenshot(chatId, session.page, `Opened URL (With Cookies):\n${session.page.url()}`);
+      return sendBrowserMenu(chatId, 'تم فتح الرابط بنجاح مع الكوكيز.');
     }
 
     if (session.step === 'awaiting_text_to_type') {
