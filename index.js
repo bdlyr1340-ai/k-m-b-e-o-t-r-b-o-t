@@ -1317,14 +1317,35 @@ bot.on('message', async (msg) => {
       session.tempUrl = null;
 
       try {
-        const cookies = JSON.parse(text);
+        // 1. تنظيف النص من الأقواس المزعجة مال التلفون
+        let cleanText = text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+        let cookies = JSON.parse(cleanText);
+
         if (Array.isArray(cookies)) {
-          await session.context.addCookies(cookies);
+          // 2. فلترة الكوكيز لحذف الحقول الزائدة اللي يرفضها المتصفح
+          const validCookies = cookies.map(c => {
+            const validCookie = {
+              name: c.name,
+              value: c.value,
+              domain: c.domain,
+              path: c.path || '/',
+            };
+            if (c.expires !== undefined) validCookie.expires = Number(c.expires);
+            if (c.httpOnly !== undefined) validCookie.httpOnly = Boolean(c.httpOnly);
+            if (c.secure !== undefined) validCookie.secure = Boolean(c.secure);
+            if (c.sameSite !== undefined && ['Strict', 'Lax', 'None'].includes(c.sameSite)) {
+              validCookie.sameSite = c.sameSite;
+            }
+            return validCookie;
+          });
+
+          await session.context.addCookies(validCookies);
           await bot.sendMessage(chatId, '✅ تمت إضافة الكوكيز بنجاح. جاري فتح الرابط...');
         } else {
           return bot.sendMessage(chatId, '❌ فشل: الكوكيز يجب أن تكون بصيغة مصفوفة JSON صالحة. افتح الرابط وحاول من جديد.');
         }
       } catch (e) {
+        console.error('Cookie error:', e);
         return bot.sendMessage(chatId, '❌ حدث خطأ في قراءة الكوكيز (تأكد من صيغة JSON وأنها غير ناقصة). افتح الرابط وحاول من جديد.');
       }
 
