@@ -914,7 +914,7 @@ bot.on('callback_query', async (query) => {
     if (data === 'browser_add_cookie') {
       if (!session.tempUrl) return bot.sendMessage(chatId, 'لا يوجد رابط محفوظ.');
       session.step = 'awaiting_cookie_data';
-      return bot.sendMessage(chatId, 'أرسل بيانات الكوكيز الآن (يجب أن تكون بصيغة مصفوفة JSON المستخرجة من الإضافة).');
+      return bot.sendMessage(chatId, 'أرسل بيانات الكوكيز الآن (كنص مباشر أو ملف مثل cookies.json).');
     }
 
     if (data === 'browser_skip_cookie') {
@@ -1180,10 +1180,31 @@ bot.on('callback_query', async (query) => {
 // --------------------------------------------------
 bot.on('message', async (msg) => {
   const chatId = String(msg.chat.id);
-  const text = (msg.text || '').trim();
-  if (!text || text.startsWith('/')) return;
-
   const session = getSession(chatId);
+
+  let text = (msg.text || '').trim();
+
+  // --- إضافة جديدة: قراءة محتوى الملف إذا دزيت ملف كوكيز ---
+  if (!text && msg.document && session.step === 'awaiting_cookie_data') {
+    try {
+      await bot.sendMessage(chatId, '⏳ جاري قراءة ملف الكوكيز...');
+      const fileLink = await bot.getFileLink(msg.document.file_id);
+      
+      // استخدام axios لأن fetch غير مدعوم في كل إصدارات Node.js
+      const axios = require('axios'); 
+      const response = await axios.get(fileLink);
+      
+      // تحويل الاستجابة إلى نص إذا لم تكن كذلك
+      text = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+      
+    } catch (err) {
+      console.error('Error reading cookie file:', err);
+      return bot.sendMessage(chatId, '❌ حدث خطأ في تحميل أو قراءة الملف. جرب إرسال محتوى الكوكيز كنص مباشر.');
+    }
+  }
+  // ---------------------------------------------------------
+
+  if (!text || text.startsWith('/')) return;
 
   try {
     // PATCH: custom grid size input
